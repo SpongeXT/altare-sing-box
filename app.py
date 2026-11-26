@@ -1,62 +1,47 @@
 #!/usr/bin/env python3
 """
-Altare sing-box 节点 - app.py v1 (基于 Nodaroo DE3 v2.2)
+Altare sing-box 节点 - app.py v2 (基于 v1, 入站改成 VLESS + WebSocket)
 部署: Altare Docker App, Stockholm, 免费档
 镜像: python:3.12-slim + 本文件 (/app/app.py), 启动命令: python app.py
 数据目录: /data (Altare data folder, 重部署保留); 本地无 /data 时回落到本文件所在目录
 
-与 DE3 v2.2 相同的做法:
-  1. 日志级别 warn (已有 config.json 只改 log level, UUID / 密钥 / Reality 不动)
+为什么从 v1 的 VLESS + Reality 改成 VLESS + WS (本版本的核心改动):
+  v1 的 Reality 走原始 TCP, 需要节点地址有公共地址才能从外网连入。
+  但斯德哥尔摩节点 se-sto10 分配给应用的端口 (172.31.31.47:26941)
+  在平台侧没有公共地址: A 记录域名 3 次提交都被拒
+  ("This port has no public address, so a domain can't point at it"),
+  刷新网络分配、新分配端口也都只拿到内网地址; 节点公开域名
+  se-sto10.tryaltare.ai:26941 从用户手机网络也连不上。
+  Altare 域名对话框提供的 HTTPS 类型是反向代理 + 证书、支持 WebSocket,
+  由 Altare 自己终结 TLS, 不需要端口有公共地址。
+  所以 v2 的入站改成 VLESS + WS (容器内不带 TLS, 由代理终结),
+  监听 0.0.0.0:PORT, 路径 /vless; 客户端用 vless + ws + tls 连
+  HTTPS 域名:443。Reality 入站不再提供, 旧的 Reality 链接在
+  重新部署后失效, 改用新的 WS 链接。
+  UUID 会保留: 已有 config.json 是 Reality 时, 启动会按旧 UUID
+  重新生成 WS 配置 (Reality 密钥作废), 链接里的 UUID 不变。
+
+与 v1 相同的做法:
+  1. 日志级别 warn
   2. 守护循环: sing-box 退出后自动重起, 退避 5 / 15 / 30 / 60 秒
   3. 健康检查: 每 60 秒读 /proc/net/tcp、/proc/net/tcp6 查监听端口
-  4. 路由首条加 IPv4-only 解析 (action=resolve, strategy=ipv4_only),
-     容器没有 IPv6 路由; 已有 config.json 也会在启动时补上
+  4. 路由首条加 IPv4-only 解析 (action=resolve, strategy=ipv4_only)
   5. 指定 DNS (8.8.8.8 / 1.1.1.1, sing-box 1.14 新格式 type+server,
      dns.strategy=ipv4_only, route.default_domain_resolver=google)
+  6. 监听端口来自环境变量, 优先级 PORT > SERVER_PORT > 8080
 
-Altare 与 Nodaroo 的不同 (重要, 先读完再部署):
-  a. 监听端口来自环境变量, 优先级 PORT > SERVER_PORT > 8080。
-     - Altare Docker 向导的 Port 字段就是应用监听的端口, 启动命令里的
-       $PORT 会被填入; Altare 文档 "Connecting to servers" 则说应用应从
-       SERVER_PORT 环境变量读主端口 ("Read the port from the SERVER_PORT
-       environment variable rather than hard-coding it")。
-       两个来源都支持, 以防向导与文档口径不一致。
-     - 已有 config.json 时, 启动会把 inbound listen_port 改成当前环境端口
-       (只改 listen_port / listen, UUID / 密钥 / Reality 不动), 并重建
-       vless-link.txt; 端口变了节点链接也要跟着换。
-  b. vless 链接里的 HOST:外部端口在容器内无法得知, 必须部署后去控制台补填:
-     - Altare 给每个应用分配一个主端口 (primary port), 客户端连的是节点地址,
-       形如 <node>.tryaltare.ai:<assigned-port> (loong 当时是
-       sg-sgp12.tryaltare.ai:26567); 另外还有 go.altare.global 的 HTTPS 域名
-       (如 sing-box.go.altare.global), 按 Altare 文档 "Connecting to servers",
-       A 记录域名加端口 (name.go.altare.global:port) 对任意协议都可用,
-       但 HTTPS 前端会终结 TLS, 不能直接走 VLESS Reality 的原始 TCP。
-     - 所以 vless-link.txt 里写的 HOST 默认是 sing-box.go.altare.global
-       (应用名就是 sing-box 时的域名猜测), 端口是容器内监听端口, 两者都只是
-       占位: 部署后务必去控制台 Network 页抄下分配到的 <node host>:<port>,
-       把链接里的 host:port 换成那个, 再导入客户端。可用环境变量 VLESS_HOST
-       覆盖 HOST (例如设成分配到的节点 host)。
-     - 本文件不保证 go.altare.global 域名 + 内部端口能直连, 这点部署后必须实测。
-  c. 配置文件没有上传入口: Altare 新建向导 1-4 步没有任何文件/配置上传控件,
-     所以配置必须由本文件在容器首次启动时生成 (UUID + Reality 密钥对),
-     凭据只写在 /data 里的 config.json / vless-link.txt, 不打印到控制台,
-     本文件里不含任何 UUID、密钥、vless 链接。
-  d. 只有 TCP 流量能到应用, linux/amd64, 无宿主机 root 权限, 与 Nodaroo 一致
-     的是 VLESS + Reality over TCP, 不用 UDP。
-
-全新服务器首次运行还会:
-  - 自动下载 sing-box 1.14.4 (linux amd64/arm64, 按机器架构选)
-  - 用 sing-box 生成 UUID 和 Reality 密钥对, 生成 config.json 和 vless-link.txt
-  - 另外写 reality-public.json (只含 public_key 和 short_id, 都是公开值,
-    不含私钥、不含 UUID), 供端口变化时重建 vless 链接用
+部署后必须做的事:
+  - 在控制台 Network 页给应用添加一个 HTTPS 类型域名
+    (名称 sing-box, 被占用时自动加短后缀, 端口指主端口),
+    拿到形如 sing-box-xxxx.go.tryaltare.ai 的域名。
+  - 把 vless-link.txt 里的 HOST 换成那个域名 (端口固定 443),
+    再导入客户端。可用环境变量 VLESS_HOST 直接指定域名,
+    这样生成的链接就不用手工替换。
 """
 import json
 import os
 import platform
-import re
-import secrets
 import subprocess
-import sys
 import tarfile
 import threading
 import time
@@ -67,17 +52,18 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 # --- 按节点改这里 ---
-# HOST 只是 vless-link.txt 里的占位域名, 见文件头说明 (b): 部署后必须按控制台
-# Network 页分配到的 <node host>:<port> 手工替换链接里的 host:port。
-# 可用环境变量 VLESS_HOST 覆盖 (例如设成分配到的节点 host)。
-HOST = os.environ.get("VLESS_HOST", "sing-box.go.altare.global")
-NODE_NAME = "Altare-STO"         # FlClash 里显示的节点名, 可改 (STO = Stockholm)
+# HOST 是 vless-link.txt 里的 HTTPS 域名占位, 部署后去控制台 Network 页
+# 添加 HTTPS 类型域名, 把拿到的域名填到环境变量 VLESS_HOST (或改这里),
+# 链接里的端口固定是 443 (HTTPS 公开端口), 不是容器内监听端口。
+HOST = os.environ.get("VLESS_HOST", "sing-box-xxxx.go.tryaltare.ai")
+NODE_NAME = "Altare-STO-WS"     # FlClash 里显示的节点名
+WS_PATH = "/vless"
+WS_PUBLIC_PORT = 443             # 客户端连 HTTPS 域名的端口
 # --------------------------------------
 
 SING_BOX_VERSION = "1.14.4"
-SNI = "www.microsoft.com"
 
-# 监听端口: PORT > SERVER_PORT > 8080 (见文件头说明 a)
+# 监听端口: PORT > SERVER_PORT > 8080
 def _resolve_port():
     for var in ("PORT", "SERVER_PORT"):
         raw = os.environ.get(var)
@@ -111,9 +97,6 @@ CONFIG_PATH = BASE / "config.json"
 SING_BOX_BIN = BASE / "sing-box"
 MONITOR_LOG = BASE / "monitor.log"
 VLESS_LINK_FILE = BASE / "vless-link.txt"
-# 只含公开值 (public_key, short_id) 的 sidecar, 供端口变化时重建链接用;
-# 不含私钥, 不含 UUID。
-REALITY_PUBLIC_FILE = BASE / "reality-public.json"
 BACKOFFS = [5, 15, 30, 60]    # 秒, 到 60 封顶
 CHECK_INTERVAL = 60           # 秒
 MAX_MISSES = 2
@@ -159,75 +142,28 @@ def ensure_sing_box():
     print(f"sing-box {SING_BOX_VERSION} downloaded", flush=True)
 
 
-def build_vless_link(user_uuid, public_key, short_id):
-    """按当前 HOST / PORT 生成 vless 链接。注意: 这里的 HOST:PORT 只是占位
-    (见文件头说明 b), 部署后必须按控制台 Network 页分配的地址替换。"""
+def build_vless_link(user_uuid):
+    """按当前 HOST 生成 VLESS + WS + TLS 链接。HOST 是 HTTPS 域名占位,
+    部署后按控制台 Network 页添加的 HTTPS 域名替换 (端口固定 443)。
+    注意: 容器内 WS 不带 TLS, TLS 由 Altare 的 HTTPS 反代终结。"""
     params = {
         "encryption": "none",
-        "flow": "xtls-rprx-vision",
-        "security": "reality",
-        "sni": SNI,
+        "security": "tls",
+        "sni": HOST,
         "fp": "chrome",
-        "pbk": public_key,
-        "sid": short_id,
-        "type": "tcp",
-        "headerType": "none",
+        "type": "ws",
+        "path": WS_PATH,
+        "host": HOST,
     }
     query = "&".join(f"{k}={urllib.parse.quote(v)}" for k, v in params.items())
-    return f"vless://{user_uuid}@{HOST}:{PORT}?{query}#{urllib.parse.quote(NODE_NAME)}"
+    return (f"vless://{user_uuid}@{HOST}:{WS_PUBLIC_PORT}?{query}"
+            f"#{urllib.parse.quote(NODE_NAME)}")
 
 
-def _read_reality_public():
-    """从 reality-public.json 或已有 vless-link.txt 里读回 public_key / short_id。
-    两者都是公开值; 读不到时返回 (None, None)。"""
-    try:
-        meta = json.loads(REALITY_PUBLIC_FILE.read_text(encoding="utf-8"))
-        if meta.get("public_key") and meta.get("short_id"):
-            return meta["public_key"], meta["short_id"]
-    except (OSError, ValueError):
-        pass
-    try:
-        link = VLESS_LINK_FILE.read_text(encoding="utf-8").strip()
-        qs = urllib.parse.urlparse(link).query
-        params = urllib.parse.parse_qs(qs)
-        pbk = params.get("pbk", [None])[0]
-        sid = params.get("sid", [None])[0]
-        if pbk and sid:
-            return pbk, sid
-    except (OSError, ValueError):
-        pass
-    return None, None
-
-
-def rebuild_vless_link(config):
-    """已有 config: 用 config 里的 UUID + 公开的 pbk/sid, 按当前 HOST / PORT
-    重建 vless-link.txt。UUID / 密钥不动。"""
-    try:
-        user_uuid = config["inbounds"][0]["users"][0]["uuid"]
-    except (KeyError, IndexError, TypeError):
-        print("[node] WARNING: cannot rebuild vless link, no uuid in config", flush=True)
-        return
-    public_key, short_id = _read_reality_public()
-    if not public_key or not short_id:
-        print("[node] WARNING: cannot rebuild vless link, no public_key/short_id "
-              "(reality-public.json and vless-link.txt both missing them)", flush=True)
-        return
-    VLESS_LINK_FILE.write_text(build_vless_link(user_uuid, public_key, short_id) + "\n",
-                               encoding="utf-8")
-    print("rebuilt vless-link.txt for current HOST/PORT (placeholder, see header b)",
-          flush=True)
-
-
-def generate_config():
-    """全新服务器: 生成 UUID + Reality 密钥对, 写 config.json 和 vless-link.txt.
-    密钥只写文件, 不打印到控制台。"""
-    user_uuid = str(uuid.uuid4())
-    out = run_capture([str(SING_BOX_BIN), "generate", "reality-keypair"])
-    private_key = re.search(r"PrivateKey:\s*(\S+)", out.stdout).group(1)
-    public_key = re.search(r"PublicKey:\s*(\S+)", out.stdout).group(1)
-    short_id = secrets.token_hex(4)  # 8 位 hex
-
-    config = {
+def build_ws_config(user_uuid):
+    """生成 VLESS + WS 配置 (容器内明文 WS, TLS 由 Altare HTTPS 反代终结)。
+    注意: WS 入站的 user 不能带 xtls-rprx-vision 等 flow, 只能是纯 uuid。"""
+    return {
         "log": {"level": "warn", "timestamp": True},
         "inbounds": [
             {
@@ -236,17 +172,11 @@ def generate_config():
                 "listen": "0.0.0.0",
                 "listen_port": PORT,
                 "users": [
-                    {"uuid": user_uuid, "flow": "xtls-rprx-vision"}
+                    {"uuid": user_uuid}
                 ],
-                "tls": {
-                    "enabled": True,
-                    "server_name": SNI,
-                    "reality": {
-                        "enabled": True,
-                        "handshake": {"server": SNI, "server_port": 443},
-                        "private_key": private_key,
-                        "short_id": [short_id],
-                    },
+                "transport": {
+                    "type": "ws",
+                    "path": WS_PATH,
                 },
             }
         ],
@@ -272,14 +202,46 @@ def generate_config():
             "final": "direct",
         },
     }
-    CONFIG_PATH.write_text(json.dumps(config, indent=2), encoding="utf-8")
-    REALITY_PUBLIC_FILE.write_text(
-        json.dumps({"public_key": public_key, "short_id": short_id}, indent=2),
-        encoding="utf-8")
 
-    VLESS_LINK_FILE.write_text(build_vless_link(user_uuid, public_key, short_id) + "\n",
-                               encoding="utf-8")
-    print("generated new config.json and vless-link.txt", flush=True)
+
+def _config_uuid(config):
+    try:
+        return config["inbounds"][0]["users"][0]["uuid"]
+    except (KeyError, IndexError, TypeError):
+        return None
+
+
+def _inbound_is_ws(config):
+    """已有 config 的入站是不是 VLESS + WS。"""
+    try:
+        inbound = config["inbounds"][0]
+    except (KeyError, IndexError, TypeError):
+        return False
+    return (inbound.get("type") == "vless"
+            and isinstance(inbound.get("transport"), dict)
+            and inbound["transport"].get("type") == "ws")
+
+
+def generate_config(user_uuid=None):
+    """全新服务器或从 v1 Reality 迁移: 生成 WS 配置 + vless-link.txt。
+    user_uuid 为空时新生成一个; 迁移时传入旧 UUID, 链接里的 UUID 不变。
+    密钥只写文件, 不打印到控制台。"""
+    if not user_uuid:
+        user_uuid = str(uuid.uuid4())
+    config = build_ws_config(user_uuid)
+    CONFIG_PATH.write_text(json.dumps(config, indent=2), encoding="utf-8")
+    VLESS_LINK_FILE.write_text(build_vless_link(user_uuid) + "\n", encoding="utf-8")
+    print("generated WS config.json and vless-link.txt", flush=True)
+
+
+def rebuild_vless_link(config):
+    """已有 WS config: 用 config 里的 UUID, 按当前 HOST 重建 vless-link.txt。"""
+    user_uuid = _config_uuid(config)
+    if not user_uuid:
+        print("[node] WARNING: cannot rebuild vless link, no uuid in config", flush=True)
+        return
+    VLESS_LINK_FILE.write_text(build_vless_link(user_uuid) + "\n", encoding="utf-8")
+    print("rebuilt vless-link.txt for current HOST (placeholder, see header)", flush=True)
 
 
 def patch_log_level():
@@ -299,8 +261,8 @@ def patch_log_level():
 
 def patch_listen_port():
     """已有 config.json: Altare 分配的端口可能变化, 把 inbound listen_port
-    (和 listen) 改成当前环境端口。只改这两项, UUID / 密钥 / Reality 不动;
-    改了端口就重建 vless-link.txt (HOST:PORT 仍是占位, 见文件头说明 b)。"""
+    (和 listen) 改成当前环境端口。只改这两项, UUID 不动;
+    改了端口就重建 vless-link.txt。"""
     try:
         config = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
     except (OSError, ValueError):
@@ -327,7 +289,7 @@ def patch_listen_port():
 
 def patch_route_ipv4():
     """已有 config.json: 路由规则首条加上 IPv4-only 解析, 避免先拨 IPv6 失败。
-    只改 route.rules, UUID / 密钥 / Reality 不动。"""
+    只改 route.rules, UUID 不动。"""
     try:
         config = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
     except (OSError, ValueError):
@@ -357,7 +319,7 @@ def patch_dns():
     """已有 config.json: 补上指定 DNS + route.default_domain_resolver。
     sing-box 1.14 已移除旧 address 格式, 必须用新格式 (type+server);
     没配 default_domain_resolver 时 1.14 会直接拒绝启动。
-    只改 dns / route.default_domain_resolver, UUID / 密钥 / Reality 不动。"""
+    只改 dns / route.default_domain_resolver, UUID 不动。"""
     try:
         config = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
     except (OSError, ValueError):
@@ -423,15 +385,27 @@ def monitor_loop(state):
 def main():
     print("[node] starting", flush=True)
     print(f"[node] {NODE_NAME} 0.0.0.0:{PORT} sing-box {SING_BOX_VERSION} base={BASE}", flush=True)
-    print("[node] WARNING: vless-link.txt uses placeholder HOST and the internal "
-          "listen port; after deploy, replace its host:port with the assigned "
-          "address from the Altare console Network page (see header b)", flush=True)
+    print("[node] WARNING: vless-link.txt uses placeholder HOST (HTTPS domain) "
+          "and port 443; after deploy, add an HTTPS domain on the Altare console "
+          "Network page and replace the host in the link (see header)", flush=True)
     ensure_sing_box()
     if CONFIG_PATH.exists():
-        patch_log_level()
-        patch_listen_port()
-        patch_route_ipv4()
-        patch_dns()
+        try:
+            config = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            config = None
+        if config is not None and _inbound_is_ws(config):
+            patch_log_level()
+            patch_listen_port()
+            patch_route_ipv4()
+            patch_dns()
+        else:
+            # v1 的 Reality 配置 (或损坏的配置): 按旧 UUID 重新生成 WS 配置,
+            # UUID 不变, Reality 密钥作废, 旧 Reality 链接失效。
+            old_uuid = _config_uuid(config) if config else None
+            print("[node] existing config is not VLESS+WS, regenerating as WS "
+                  f"(keeping uuid={bool(old_uuid)})", flush=True)
+            generate_config(old_uuid)
     else:
         generate_config()
 
